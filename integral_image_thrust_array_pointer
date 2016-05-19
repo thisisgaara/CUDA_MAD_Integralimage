@@ -1,0 +1,239 @@
+//=============================================================================
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <thrust/host_vector.h> 
+#include <thrust/device_vector.h> 
+#include <iostream> 
+#include <thrust/functional.h>
+#include <thrust/gather.h>
+#include <thrust/scan.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <iostream>
+#include <iomanip>
+//=============================================================================
+#define   N              4
+#define   IMG_SIZE       N*N
+#define   IMG_BYTES      IMG_SIZE*sizeof(int)
+//=============================================================================
+
+// Template structure to pass to kernel
+template <typename T>
+struct KernelArray
+{
+	T*	_array;
+	int _size;
+};
+
+// Function to convert device_vector to structure
+template <typename T>
+KernelArray<T> convertToKernel(thrust::device_vector<T>& dVec)
+{
+	KernelArray<T> kArray;
+	kArray._array = thrust::raw_pointer_cast(&dVec[0]);
+	kArray._size = (int)dVec.size();
+
+	return kArray;
+}
+
+// Initialize array with a synthetic input image
+template <typename T>
+void initialize(size_t m, size_t n, thrust::host_vector<T>& hVec1, thrust::host_vector<T>& hVec2)
+{
+	for (size_t i = 0; i < m; ++i)
+	{
+		for (size_t j = 0; j < n; ++j)
+		{
+			hVec1[i * n + j] = (i * n + j);
+			hVec2[i * n + j] = hVec1[i * n + j] * hVec1[i * n + j];
+		}
+	}
+}
+
+// Initialize array with a synthetic input image
+void initialize(size_t m, size_t n, int* hArr1, int* hArr2)
+{
+	for (size_t i = 0; i < m; ++i)
+	{
+		for (size_t j = 0; j < n; ++j)
+		{
+			hArr1[i * n + j] = (i * n + j);
+			hArr2[i * n + j] = hArr1[i * n + j] * hArr1[i * n + j];
+		}
+	}
+}
+
+// print an M-by-N device_vector
+template <typename T>
+void print(size_t m, size_t n, thrust::device_vector<T>& d_data)
+{
+	thrust::host_vector<T> h_data = d_data;
+
+	for (size_t i = 0; i < m; i++)
+	{
+		for (size_t j = 0; j < n; j++)
+			std::cout << std::setw(8) << h_data[i * n + j] << " ";
+		std::cout << "\n";
+	}
+	printf("\n");
+}
+
+// print an M-by-N host_vector
+template <typename T>
+void print(size_t m, size_t n, thrust::host_vector<T>& h_data)
+{
+	for (size_t i = 0; i < m; i++)
+	{
+		for (size_t j = 0; j < n; j++)
+			std::cout << std::setw(8) << h_data[i * n + j] << " ";
+		std::cout << "\n";
+	}
+	printf("\n");
+}
+
+// print an M-by-N array
+void print(size_t m, size_t n, int* h_data)
+{
+	for (size_t i = 0; i < m; i++)
+	{
+		for (size_t j = 0; j < n; j++)
+			std::cout << std::setw(8) << h_data[i * n + j] << " ";
+		std::cout << "\n";
+	}
+	printf("\n");
+}
+
+// convert a linear index to a row index
+struct row_index : public thrust::unary_function<size_t, size_t>
+{
+	size_t n;
+
+	__host__ __device__
+		row_index(size_t _n) : n(_n) {}
+
+	__host__ __device__
+		size_t operator()(size_t i)
+	{
+			return i / n;
+		}
+};
+
+// scan the rows of an M-by-N array
+template <typename T>
+void scan_horizontally(size_t m, size_t n, thrust::device_vector<T>& d_data)
+{
+	thrust::counting_iterator<size_t> indices(0);
+
+	thrust::inclusive_scan_by_key
+		(thrust::make_transform_iterator(indices, row_index(n)),
+		thrust::make_transform_iterator(indices, row_index(n)) + d_data.size(),
+		d_data.begin(),
+		d_data.begin());
+}
+
+// to be launched with one thread per row of output matrix
+__global__ void transpose_parallel_per_row(KernelArray<int> out, KernelArray<int> in)
+{
+	int i = threadIdx.x;
+
+	for (int j = 0; j < N; j++)
+		out._array[j + i*N] = in._array[i + j*N]; // out(j,i) = in(i,j)
+}
+__global__ void transpose_parallel_per_row(thrust::device_ptr<int> out, thrust::device_ptr<int> in)
+{
+	int i = threadIdx.x;
+
+	for (int j = 0; j < N; j++)
+		out[j + i*N] = in[i + j*N]; // out(j,i) = in(i,j)
+}
+__global__ void transpose_parallel_per_row(int* out, thrust::device_ptr<int> in)
+{
+	int i = threadIdx.x;
+
+	for (int j = 0; j < N; j++)
+		out[j + i*N] = in[i + j*N]; // out(j,i) = in(i,j)
+}
+
+int main(void)
+{
+	// ARRAY
+	// Allocate host and device memory
+	// Array stored in row-major order [(0,0), (0,1), (0,2), ... ]
+	int hArr_I1[IMG_SIZE];    //cudaMallocHost(&hArr_I1, IMG_BYTES);
+	int hArr_I2[IMG_SIZE];    //cudaMallocHost(&hArr_I2, IMG_BYTES);
+	int hArr_I3[IMG_SIZE];    //cudaMallocHost(&hArr_I1, IMG_BYTES);
+	int hArr_I4[IMG_SIZE];    //cudaMallocHost(&hArr_I2, IMG_BYTES);
+
+	int *dArr_I1;    cudaMalloc(&dArr_I1, IMG_BYTES);
+	int *dArr_I2;    cudaMalloc(&dArr_I2, IMG_BYTES);
+
+	// ARRAY
+	// Innitialize vector with synthetic image:
+	printf("\nInitial host array:\n");
+	initialize(N, N, hArr_I1, hArr_I2);
+	cudaMemcpy(dArr_I1, hArr_I1, IMG_BYTES, cudaMemcpyHostToDevice); // HOST -> DEVICE
+	cudaMemcpy(dArr_I2, hArr_I2, IMG_BYTES, cudaMemcpyHostToDevice); // HOST -> DEVICE
+	print(N, N, hArr_I1);
+	print(N, N, hArr_I2);
+
+	// ARRAY [step 1] Scan horizontally
+	thrust::device_ptr<int> dPtr_M1 = thrust::device_pointer_cast(dArr_I1);
+	thrust::counting_iterator<int> indices1(0);
+	thrust::inclusive_scan_by_key
+		(thrust::make_transform_iterator(indices1, row_index(N)),
+		thrust::make_transform_iterator(indices1, row_index(N)) + IMG_SIZE,
+		dPtr_M1,
+		dPtr_M1);
+	thrust::device_ptr<int> dPtr_M2 = thrust::device_pointer_cast(dArr_I2);
+	thrust::counting_iterator<int> indices2(0);
+	thrust::inclusive_scan_by_key
+		(thrust::make_transform_iterator(indices2, row_index(N)),
+		thrust::make_transform_iterator(indices2, row_index(N)) + IMG_SIZE,
+		dPtr_M2,
+		dPtr_M2);
+
+
+	// ARRAY [step 2] transpose array
+	int *dArr_temp1;    cudaMalloc(&dArr_temp1, IMG_BYTES);
+	int *dArr_temp2;    cudaMalloc(&dArr_temp2, IMG_BYTES);
+
+	transpose_parallel_per_row << < 1, N >> > (dArr_temp1, dPtr_M1);
+	transpose_parallel_per_row << < 1, N >> > (dArr_temp2, dPtr_M2);
+
+	cudaMemcpy(hArr_I3, dArr_temp1, IMG_BYTES, cudaMemcpyDeviceToHost); // Verification
+	cudaMemcpy(hArr_I4, dArr_temp2, IMG_BYTES, cudaMemcpyDeviceToHost); // Verification
+
+	// ARRAY [step 3] scan transpose horizontally
+	thrust::device_ptr<int> dPtr_M11 = thrust::device_pointer_cast(dArr_temp1);
+	thrust::counting_iterator<int> indices11(0);
+	thrust::inclusive_scan_by_key
+		(thrust::make_transform_iterator(indices11, row_index(N)),
+		thrust::make_transform_iterator(indices11, row_index(N)) + IMG_SIZE,
+		dPtr_M11,
+		dPtr_M11);
+	thrust::device_ptr<int> dPtr_M22 = thrust::device_pointer_cast(dArr_temp2);
+	thrust::counting_iterator<int> indices22(0);
+	thrust::inclusive_scan_by_key
+		(thrust::make_transform_iterator(indices22, row_index(N)),
+		thrust::make_transform_iterator(indices22, row_index(N)) + IMG_SIZE,
+		dPtr_M22,
+		dPtr_M22);
+	cudaMemcpy(hArr_I3, dArr_temp1, IMG_BYTES, cudaMemcpyDeviceToHost); // Verification
+	cudaMemcpy(hArr_I4, dArr_temp2, IMG_BYTES, cudaMemcpyDeviceToHost); // Verification
+
+	// ARRAY [step 4] transpose the transpose
+	int *dArr_out1;    cudaMalloc(&dArr_out1, IMG_BYTES);
+	int *dArr_out2;    cudaMalloc(&dArr_out2, IMG_BYTES);
+	transpose_parallel_per_row << < 1, N >> > (dArr_out1, dPtr_M11);
+	transpose_parallel_per_row << < 1, N >> > (dArr_out2, dPtr_M22);
+
+	// Print result:
+	int hArr_out1[IMG_SIZE];    //cudaMallocHost(&hArr_out1, IMG_BYTES);
+	cudaMemcpy(hArr_out1, dArr_out1, IMG_BYTES, cudaMemcpyDeviceToHost); // DEVIEC -> HOST
+	printf("DEBUG Results:\n");
+	print(N, N, hArr_out1);
+	getchar();
+	return 0;
+}
